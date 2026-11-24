@@ -1,0 +1,1129 @@
+"""
+Kalkulator Analisis & Desain Dinding Penahan Tanah (DPT) - versi revisi
+=======================================================================
+Perubahan utama dibanding versi awal:
+  1. Daya dukung: kapasitas dukung Meyerhof (c, phi, gamma) dengan lebar efektif
+     B' = B - 2e, faktor kedalaman dan faktor kemiringan beban. q_all (laporan
+     tanah) menjadi pemeriksaan tambahan, bukan satu-satunya dasar.
+  2. Geser dasar: delta = rasio x phi (bukan phi penuh), kohesi direduksi (Rc),
+     zona tanah depan yang dapat tergerus/terganggu diabaikan, tanpa penjumlahan
+     tahanan yang saling tumpang tindih.
+  3. Kombinasi beban terfaktor mengikuti pola SNI 1727:2020 (H berfaktor 1,6 juga
+     pada kombinasi gempa).
+  4. Geser beton tanpa sengkang memakai Tabel 22.5.5.1 SNI 2847:2019 (faktor ukuran
+     lambda_s dan rho_w^(1/3)), bukan rumus sederhana 0,17.sqrt(fc').
+  5. Heel dan toe didesain dari reaksi tanah tiap kombinasi terfaktor (envelope),
+     bukan dari reaksi layan yang dikali faktor acak.
+  6. Penampang pocket pagar dicek apa adanya (tidak ada lagi d dipaksa 50 mm).
+  7. Delta-Kae konsisten dengan Ka Rankine (delta dinding M-O = 0 secara default).
+  8. kh dapat diturunkan dari PGA_M (faktor dapat diubah, wajib diverifikasi).
+  9. Bug berat pelat dasar saat toe > 0 diperbaiki; input c tanah urug yang tidak
+     dipakai dihapus; batas minimum selimut beton dinaikkan.
+ 10. Export Excel berisi nilai hasil perhitungan (bukan rumus) agar tidak berbeda
+     dengan metode terbaru.
+
+PENTING: ini alat bantu preliminary. Belum mencakup stabilitas global (lereng),
+penurunan, muka air tanah/tekanan air, dan desain struktur shear key.
+Seluruh faktor SF dan pasal SNI harus diverifikasi terhadap dokumen resmi.
+"""
+import io
+import math
+from datetime import datetime
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import streamlit as st
+
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.drawing.image import Image as XLImage
+
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+GAMMA_C = 24.0  # kN/m3 berat jenis beton bertulang
+
+
+# ==============================================================================
+# FUNGSI BANTU NUMERIK
+# ==============================================================================
+def _integrate(fn, a, b, n=400):
+    """Integral trapesium fn(x) dari a ke b."""
+    if b - a <= 1e-9:
+        return 0.0
+    xs = np.linspace(a, b, n + 1)
+    ys = np.asarray(fn(xs), dtype=float)
+    return float(np.sum((ys[:-1] + ys[1:]) * 0.5 * np.diff(xs)))
+
+
+def base_pressure(V, M_net, B):
+    """
+    Distribusi tegangan dasar linear dari resultan vertikal V dan momen netto
+    terhadap ujung depan (toe). x = 0 di ujung toe. Menangani e > B/6 (kontak
+    parsial) dan e < 0 (resultan bergeser ke heel).
+    """
+    out = {
+        "valid": False, "xR": 0.0, "e": 0.0, "q_toe": 0.0, "q_heel": 0.0,
+        "q_max": 0.0, "q_min": 0.0, "Lc": 0.0, "mode": "tidak valid",
+        "fn": (lambda x: np.zeros_like(np.asarray(x, dtype=float))),
+    }
+    if V <= 1e-9:
+        return out
+    xR = M_net / V
+    e = B / 2.0 - xR  # e > 0: resultan bergeser ke arah toe
+    out["xR"], out["e"] = xR, e
+    if xR <= 0.0 or xR >= B:
+        out["mode"] = "resultan di luar dasar (guling)"
+        return out
+
+    if abs(e) <= B / 6.0 + 1e-12:
+        q_toe = V / B * (1.0 + 6.0 * e / B)
+        q_heel = V / B * (1.0 - 6.0 * e / B)
+        Lc = B
+        mode = "kontak penuh"
+
+        def fn(x, a=q_toe, b=q_heel):
+            return a + (b - a) * np.asarray(x, dtype=float) / B
+    elif e > 0:
+        Lc = 3.0 * xR
+        q_toe, q_heel = 2.0 * V / Lc, 0.0
+        mode = "kontak parsial (dari toe)"
+
+        def fn(x, Lc=Lc, qt=q_toe):
+            xx = np.asarray(x, dtype=float)
+            return np.where(xx <= Lc, qt * (1.0 - xx / Lc), 0.0)
+    else:
+        Lc = 3.0 * (B - xR)
+        q_toe, q_heel = 0.0, 2.0 * V / Lc
+        mode = "kontak parsial (dari heel)"
+
+        def fn(x, Lc=Lc, qh=q_heel):
+            xr = B - np.asarray(x, dtype=float)
+            return np.where(xr <= Lc, qh * (1.0 - xr / Lc), 0.0)
+
+    out.update({
+        "valid": True, "q_toe": q_toe, "q_heel": q_heel,
+        "q_max": max(q_toe, q_heel), "q_min": min(q_toe, q_heel),
+        "Lc": Lc, "mode": mode, "fn": fn,
+    })
+    return out
+
+
+def meyerhof_qult(c, phi_deg, gamma, D, B_eff, theta_deg):
+    """
+    Kapasitas dukung ultimit pondasi menerus (Meyerhof) dengan faktor kedalaman
+    dan faktor kemiringan beban. Satuan kPa. D = kedalaman efektif (m).
+    """
+    phi = math.radians(phi_deg)
+    if phi_deg < 1e-6:
+        Nq, Nc, Ng = 1.0, 5.14, 0.0
+    else:
+        Nq = math.exp(math.pi * math.tan(phi)) * math.tan(math.radians(45.0 + phi_deg / 2.0)) ** 2
+        Nc = (Nq - 1.0) / math.tan(phi)
+        Ng = (Nq - 1.0) * math.tan(1.4 * phi)
+    Kp_m = math.tan(math.radians(45.0 + phi_deg / 2.0)) ** 2
+    ratio = D / B_eff if B_eff > 0 else 0.0
+    dc = 1.0 + 0.2 * math.sqrt(Kp_m) * ratio
+    dq = dg = (1.0 + 0.1 * math.sqrt(Kp_m) * ratio) if phi_deg > 10.0 else 1.0
+    ic = iq = max(0.0, 1.0 - theta_deg / 90.0) ** 2
+    ig = max(0.0, 1.0 - theta_deg / phi_deg) ** 2 if phi_deg > 0 else 0.0
+    q_over = gamma * D
+    t_c = c * Nc * dc * ic
+    t_q = q_over * Nq * dq * iq
+    t_g = 0.5 * gamma * B_eff * Ng * dg * ig
+    return {
+        "q_ult": t_c + t_q + t_g, "Nc": Nc, "Nq": Nq, "Ng": Ng,
+        "dc": dc, "dq": dq, "ic": ic, "ig": ig, "theta": theta_deg,
+        "B_eff": B_eff, "q_over": q_over,
+    }
+
+
+def calc_kh(mode, kh_manual, pga, f_pga, factor):
+    """kh manual atau kh = faktor x F_PGA x PGA (dalam g). Faktor wajib diverifikasi."""
+    if mode.startswith("Input"):
+        return kh_manual
+    return factor * f_pga * pga
+
+
+# ==============================================================================
+# CEK PENAMPANG BETON (SNI 2847:2019, per 1 m lebar)
+# ==============================================================================
+def check_section(Mu, Vu, h_mm, cc_mm, db_mm, sp_mm, fc, fy, fail_note=None):
+    b = 1000.0
+    d = h_mm - cc_mm - 0.5 * db_mm
+    notes = []
+    As_prov = (1000.0 / sp_mm) * (0.25 * math.pi * db_mm ** 2)
+    rho_min = 0.0020 if fy < 420.0 else max(0.0018 * 420.0 / fy, 0.0014)
+    As_min = rho_min * b * h_mm
+    base = {
+        "h_mm": h_mm, "d_mm": d, "Mu": Mu, "Vu": Vu, "As_prov": As_prov,
+        "As_min": As_min,
+    }
+    if d < 30.0:
+        base.update({
+            "As_req": float("nan"), "phi_Mn": 0.0, "dc_flex": 99.0, "phi_Vc": 0.0,
+            "dc_shear": 99.0, "eps_t": float("nan"), "s_max": float("nan"),
+            "status": "NOT OK", "notes": "Tinggi efektif d tidak valid (penampang terlalu tipis)",
+        })
+        return base
+
+    beta1 = 0.85 if fc <= 28.0 else max(0.65, 0.85 - 0.05 * (fc - 28.0) / 7.0)
+
+    # As perlu (asumsi tension-controlled, phi = 0,9)
+    Rn = (Mu * 1e6) / (0.9 * b * d ** 2)
+    term = 1.0 - (2.0 * Rn) / (0.85 * fc)
+    if term <= 0:
+        As_flex = 0.05 * b * d
+        notes.append("Penampang terlalu tipis untuk Mu")
+        too_thin = True
+    else:
+        As_flex = (0.85 * fc / fy) * (1.0 - math.sqrt(term)) * b * d
+        too_thin = False
+    As_req = max(As_flex, As_min)
+
+    # Kapasitas lentur dengan phi dari regangan tarik
+    a = (As_prov * fy) / (0.85 * fc * b)
+    c_na = a / beta1
+    eps_t = 0.003 * (d - c_na) / c_na if c_na > 0 else 0.01
+    if eps_t >= 0.005:
+        phi_f = 0.90
+    elif eps_t <= 0.002:
+        phi_f = 0.65
+    else:
+        phi_f = 0.65 + 0.25 * (eps_t - 0.002) / 0.003
+    phi_Mn = phi_f * As_prov * fy * (d - a / 2.0) / 1e6
+    dc_flex = Mu / phi_Mn if phi_Mn > 0 else 99.0
+
+    # Geser satu arah tanpa sengkang (Tabel 22.5.5.1 butir Av < Av,min), lambda = 1
+    rho_w = As_prov / (b * d)
+    lam_s = min(1.0, math.sqrt(2.0 / (1.0 + d / 250.0)))
+    sqrt_fc = min(math.sqrt(fc), 8.3)
+    Vc = min(0.66 * lam_s * (rho_w ** (1.0 / 3.0)) * sqrt_fc * b * d,
+             0.42 * sqrt_fc * b * d) / 1000.0
+    phi_Vc = 0.75 * Vc
+    dc_shear = Vu / phi_Vc if phi_Vc > 0 else 99.0
+
+    # Spasi maksimum pengendalian retak (Pasal 24.3.2), fs = 2/3 fy
+    fs = 2.0 / 3.0 * fy
+    s_max = min(380.0 * (280.0 / fs) - 2.5 * cc_mm, 300.0 * (280.0 / fs))
+
+    ok = True
+    if dc_flex > 1.0:
+        ok = False
+        notes.append("Lentur kurang")
+    if dc_shear > 1.0:
+        ok = False
+        notes.append("Geser kurang (perlu tebal/tulangan lebih besar atau sengkang)")
+    if As_prov < As_min:
+        ok = False
+        notes.append("As < As min")
+    if eps_t < 0.004:
+        ok = False
+        notes.append("Tidak memenuhi batas regangan tarik")
+    if sp_mm > s_max:
+        ok = False
+        notes.append(f"Spasi > {s_max:.0f} mm")
+    if too_thin:
+        ok = False
+    if fail_note:
+        ok = False
+        notes.append(fail_note)
+
+    base.update({
+        "As_req": As_req, "phi_Mn": phi_Mn, "dc_flex": dc_flex, "phi_Vc": phi_Vc,
+        "dc_shear": dc_shear, "eps_t": eps_t, "s_max": s_max,
+        "status": "OK" if ok else "NOT OK", "notes": "; ".join(notes),
+    })
+    return base
+
+
+# ==============================================================================
+# MESIN PERHITUNGAN
+# ==============================================================================
+def run_calculations(p):
+    gc = GAMMA_C
+    B = p.B_toe + p.t_bot + p.B_heel
+    H_stem = p.H_exp + p.D_f            # tinggi stem di atas muka pelat
+    H_tot = H_stem + p.t_slab_base      # tinggi total dari dasar pelat
+    D_emb = p.t_slab_base + p.D_f       # kedalaman muka tanah depan terhadap dasar pelat
+    dt_slab = max(0.0, p.t_slab_base - p.t_slab_tip)
+    dtt = max(0.0, p.t_bot - p.t_top)
+    phi1 = math.radians(p.phi_1)
+    phi2 = math.radians(p.phi_2)
+    kh = p.k_h
+    warnings = []
+
+    # ---------------- 1. Koefisien tekanan tanah ----------------
+    Ka = math.tan(math.radians(45.0 - p.phi_1 / 2.0)) ** 2
+    Kp = math.tan(math.radians(45.0 + p.phi_2 / 2.0)) ** 2
+
+    # Mononobe-Okabe (beta = i = 0, kv = 0). delta dinding default 0 -> konsisten dengan Rankine
+    delta_mo = p.delta_mo_ratio * phi1
+    psi = math.atan(kh)
+    seismic_valid = (kh <= 0) or (phi1 > psi)
+    if kh > 0 and seismic_valid:
+        num = math.cos(phi1 - psi) ** 2
+        sq = math.sqrt((math.sin(phi1 + delta_mo) * math.sin(phi1 - psi)) / math.cos(delta_mo + psi))
+        den = math.cos(psi) * math.cos(delta_mo + psi) * ((1.0 + sq) ** 2)
+        Kae = num / den
+        dKae = max(0.0, Kae - Ka)
+    else:
+        Kae, dKae = Ka, 0.0
+    if not seismic_valid:
+        warnings.append("phi tanah urug <= arctan(kh): Mononobe-Okabe tidak valid, kondisi gempa dianggap GAGAL.")
+
+    # ---------------- 2. Gaya vertikal & momen penahan (x = 0 di ujung toe) ----------------
+    items = []  # (nama, V, x, jenis, y_inersia)
+
+    def add(name, V, x, kind, y=None):
+        items.append((name, V, x, kind, y))
+
+    w1 = p.t_top * H_stem * gc
+    x1 = p.B_toe + dtt + p.t_top / 2.0
+    add("W1 - Dinding (Stem Persegi)", w1, x1, "beton", p.t_slab_base + H_stem / 2.0)
+
+    w2 = 0.5 * dtt * H_stem * gc
+    x2 = p.B_toe + (2.0 / 3.0) * dtt
+    add("W2 - Dinding (Stem Miring)", w2, x2, "beton", p.t_slab_base + H_stem / 3.0)
+
+    w3a = (p.B_toe + p.t_bot) * p.t_slab_base * gc
+    x3a = (p.B_toe + p.t_bot) / 2.0
+    add("W3a - Pelat Dasar (Toe + bawah Stem)", w3a, x3a, "beton", p.t_slab_base / 2.0)
+
+    w3b = p.B_heel * p.t_slab_tip * gc
+    x3b = p.B_toe + p.t_bot + p.B_heel / 2.0
+    add("W3b - Pelat Dasar (Heel, tebal ujung)", w3b, x3b, "beton", p.t_slab_tip / 2.0)
+
+    w4 = 0.5 * p.B_heel * dt_slab * gc
+    x4 = p.B_toe + p.t_bot + p.B_heel / 3.0
+    add("W4 - Pelat Dasar (Miring Heel)", w4, x4, "beton", p.t_slab_tip + dt_slab / 3.0)
+
+    w5 = p.B_key * p.D_key * gc if p.use_shear_key else 0.0
+    x5 = p.B_toe + p.t_bot - p.B_key / 2.0
+    add("W5 - Shear Key Beton", w5, x5, "beton", 0.0)  # y = 0: lengan inersia key diabaikan
+
+    w6a = p.B_heel * H_stem * p.gamma_1
+    x6a = p.B_toe + p.t_bot + p.B_heel / 2.0
+    w6b = 0.5 * p.B_heel * dt_slab * p.gamma_1
+    x6b = p.B_toe + p.t_bot + (2.0 / 3.0) * p.B_heel
+    w6 = w6a + w6b
+    x6 = (w6a * x6a + w6b * x6b) / w6 if w6 > 0 else x6a
+    add("W6 - Tanah Urug di atas Heel", w6, x6, "tanah")
+
+    w7 = p.q_surch * p.B_heel
+    x7 = p.B_toe + p.t_bot + p.B_heel / 2.0
+    add("W7 - Beban Surcharge di atas Heel", w7, x7, "hidup")
+
+    w8 = p.B_toe * p.D_f * p.gamma_2
+    x8 = p.B_toe / 2.0
+    add("W8 - Tanah Penutup di atas Toe", w8, x8, "tanah")
+
+    w9 = (p.H_panel * 0.05 * gc + 0.35) if p.use_fence else 0.0  # estimasi panel 50 mm + kolom
+    x9 = x1
+    add("W9 - Berat Pagar Precast Atas", w9, x9, "beton", H_tot + p.H_panel / 2.0)
+
+    df_v = pd.DataFrame([(n, V, x) for n, V, x, _, _ in items],
+                        columns=["Komponen", "Gaya_V (kN/m)", "Lengan_x (m)"])
+    df_v["Momen_Penahan (kNm/m)"] = df_v["Gaya_V (kN/m)"] * df_v["Lengan_x (m)"]
+
+    V_all = sum(V for _, V, _, _, _ in items)
+    MR_all = sum(V * x for _, V, x, _, _ in items)
+    V_noq = V_all - w7
+    MR_noq = MR_all - w7 * x7
+    V_dead = V_noq
+    MR_dead = MR_noq
+
+    # ---------------- 3. Gaya horizontal ----------------
+    Pa = 0.5 * Ka * p.gamma_1 * H_tot ** 2
+    ya = H_tot / 3.0
+    Pq = Ka * p.q_surch * H_tot
+    yq = H_tot / 2.0
+    H_fence_tot = (p.H_panel + p.H_wire) if p.use_fence else 0.0
+    Pw = p.q_wind * H_fence_tot
+    yw = H_tot + H_fence_tot / 2.0
+    dPae = 0.5 * dKae * p.gamma_1 * H_tot ** 2
+    ydae = 0.6 * H_tot
+
+    W_inert = sum(V for _, V, _, kind, _ in items if kind == "beton")
+    M_inert = sum(V * y for _, V, _, kind, y in items if kind == "beton")
+    Pir = kh * W_inert
+    yir = (M_inert / W_inert) if W_inert > 0 else 0.45 * H_tot
+
+    # ---------------- 4. Tahanan geser ----------------
+    delta_b = p.delta_ratio * phi2
+    mu_eff = min(p.mu_base, math.tan(delta_b))
+    c_d = p.R_c * p.c_2
+    z0 = min(p.z_ign, D_emb)
+    Pp_front_raw = 0.5 * Kp * p.gamma_2 * (D_emb ** 2 - z0 ** 2) + 2.0 * c_d * math.sqrt(Kp) * (D_emb - z0)
+    Pp_key_raw = (0.5 * Kp * p.gamma_2 * p.D_key ** 2 + 2.0 * c_d * math.sqrt(Kp) * p.D_key) if p.use_shear_key else 0.0
+    Rp = p.R_pasif if p.use_passive else 0.0
+    Pp_front = Rp * Pp_front_raw
+    Pp_key = Rp * Pp_key_raw
+    D_bc = max(0.0, D_emb - z0)  # kedalaman efektif untuk daya dukung
+
+    def evaluate_case(Fh, Mo):
+        press = base_pressure(V_all, MR_all - Mo, B)
+        SF_ot = MR_noq / Mo if Mo > 0 else 99.0
+        Lc = press["Lc"] if press["valid"] else 0.0
+        Fr = mu_eff * V_noq + c_d * Lc + Pp_front + Pp_key
+        SF_sl = Fr / Fh if Fh > 0 else 99.0
+        if press["valid"]:
+            theta = math.degrees(math.atan2(Fh, V_all))
+            B_eff = B - 2.0 * abs(press["e"])
+            bc = meyerhof_qult(p.c_2, p.phi_2, p.gamma_2, D_bc, B_eff, theta)
+            q_app = V_all / B_eff if B_eff > 0 else float("inf")
+            SF_bc = bc["q_ult"] / q_app if q_app > 0 else 99.0
+        else:
+            bc = None
+            q_app = float("inf")
+            SF_bc = 0.0
+        return {
+            "Fh": Fh, "Mo": Mo, "Fr": Fr, "press": press, "SF_ot": SF_ot, "SF_sl": SF_sl,
+            "SF_bc": SF_bc, "bc": bc, "q_app": q_app,
+        }
+
+    Fh_stat = Pa + Pq + Pw
+    Mo_stat = Pa * ya + Pq * yq + Pw * yw
+    case_stat = evaluate_case(Fh_stat, Mo_stat)
+
+    Fh_seis = Pa + Pq + dPae + Pir
+    Mo_seis = Pa * ya + Pq * yq + dPae * ydae + Pir * yir
+    case_seis = evaluate_case(Fh_seis, Mo_seis)
+    if not seismic_valid:
+        case_seis["SF_ot"] = case_seis["SF_sl"] = case_seis["SF_bc"] = 0.0
+
+    for tag, cs in (("statis", case_stat), ("gempa", case_seis)):
+        if not cs["press"]["valid"]:
+            warnings.append(f"Kondisi {tag}: resultan di luar dasar pondasi (guling).")
+        elif cs["press"]["mode"].startswith("kontak parsial"):
+            warnings.append(f"Kondisi {tag}: eksentrisitas melebihi B/6 ({cs['press']['mode']}).")
+
+    q_stat, q_seis = case_stat["press"], case_seis["press"]
+    SF_gov_stat = min(case_stat["SF_ot"], case_stat["SF_sl"], case_stat["SF_bc"])
+    SF_gov_seis = min(case_seis["SF_ot"], case_seis["SF_sl"], case_seis["SF_bc"])
+
+    # ---------------- 5. Struktur beton ----------------
+    # 5A. Stem: penampang kritis di muka atas pelat
+    Hs = H_stem
+    Pa_s = 0.5 * Ka * p.gamma_1 * Hs ** 2
+    Pq_s = Ka * p.q_surch * Hs
+    dPae_s = 0.5 * dKae * p.gamma_1 * Hs ** 2
+    inert_s = [(w1, Hs / 2.0), (w2, Hs / 3.0), (w9, Hs + p.H_panel / 2.0)]
+    Pir_s = kh * sum(w for w, _ in inert_s)
+    M_Pir_s = kh * sum(w * y for w, y in inert_s)
+
+    Mu_s1 = 1.6 * (Pa_s * Hs / 3.0 + Pq_s * Hs / 2.0) + 1.0 * Pw * (Hs + H_fence_tot / 2.0)
+    Mu_s2 = (1.6 * Pa_s * Hs / 3.0 + 1.0 * Pq_s * Hs / 2.0 + 1.0 * (dPae_s * 0.6 * Hs + M_Pir_s))
+    d_stem = (p.t_bot * 1000.0 - p.cc_wall - 0.5 * p.D_wall) / 1000.0
+    Hv = max(0.1, Hs - d_stem)
+    Pa_v = 0.5 * Ka * p.gamma_1 * Hv ** 2
+    Pq_v = Ka * p.q_surch * Hv
+    dPae_v = 0.5 * dKae * p.gamma_1 * Hv ** 2
+    Vu_s1 = 1.6 * (Pa_v + Pq_v) + 1.0 * Pw
+    Vu_s2 = 1.6 * Pa_v + 1.0 * Pq_v + 1.0 * (dPae_v + Pir_s)
+    stem_cases = [("1.6H + 1.6L + 1.0W", Mu_s1, Vu_s1)]
+    if seismic_valid:
+        stem_cases.append(("1.6H + 1.0L + 1.0E", Mu_s2, Vu_s2))
+    gov_stem = max(stem_cases, key=lambda t: t[1])
+    Mu_stem = gov_stem[1]
+    Vu_stem = max(t[2] for t in stem_cases)
+    rebar_stem = check_section(Mu_stem, Vu_stem, p.t_bot * 1000.0, p.cc_wall, p.D_wall, p.s_wall, p.fc, p.fy)
+    rebar_stem["combo"] = gov_stem[0]
+
+    # 5B. Pocket pagar (pendekatan; detail pocket sebaiknya didesain khusus)
+    if p.use_fence and Pw > 0:
+        Mu_pocket = 1.0 * Pw * (H_fence_tot / 2.0 + p.d_pocket / 2.0)
+        t_pocket_wall = (p.t_top * 1000.0 - 170.0) / 2.0  # asumsi lebar pocket 170 mm
+        rebar_pocket = check_section(Mu_pocket, 1.0 * Pw, t_pocket_wall, 25.0, 10, 150, p.fc, p.fy,
+                                     fail_note="Detail pocket perlu desain khusus")
+        rebar_pocket["combo"] = "1.0W"
+    else:
+        rebar_pocket = None
+
+    # 5C. Pelat dasar: reaksi tanah dihitung ulang untuk tiap kombinasi terfaktor
+    combos = [
+        ("1.2D + 1.6L + 1.6H + 1.0W", 1.2, 1.6, 1.6, 1.6, 1.0, 0.0),
+        ("0.9D + 1.6H + 1.0W", 0.9, 0.0, 1.6, 1.6, 1.0, 0.0),
+    ]
+    if seismic_valid:
+        combos += [
+            ("1.2D + 1.0L + 1.6H + 1.0E", 1.2, 1.0, 1.6, 1.0, 0.0, 1.0),
+            ("0.9D + 1.6H + 1.0E", 0.9, 0.0, 1.6, 1.0, 0.0, 1.0),
+        ]
+
+    x_face = p.B_toe + p.t_bot
+    d_slab_m = (p.t_slab_base * 1000.0 - p.cc_slab - 0.5 * p.D_heel) / 1000.0
+    d_toe_m = (p.t_slab_base * 1000.0 - p.cc_slab - 0.5 * p.D_toe) / 1000.0
+    W_slab_toe = p.B_toe * p.t_slab_base * gc
+    rows_found = []
+    heel_best = {"Mu": 0.0, "Vu": 0.0, "combo": "-"}
+    toe_best = {"Mu": 0.0, "Vu": 0.0, "combo": "-"}
+    foundation_invalid = False
+    for name, fD, fLv, fH, fLh, fW, fE in combos:
+        V_c = fD * V_dead + fLv * w7
+        MR_c = fD * MR_dead + fLv * w7 * x7
+        Mo_c = (fH * Pa * ya + fLh * Pq * yq + fW * Pw * yw + fE * (dPae * ydae + Pir * yir))
+        pr = base_pressure(V_c, MR_c - Mo_c, B)
+        if not pr["valid"]:
+            foundation_invalid = True
+            rows_found.append({"Kombinasi": name, "ΣV_u (kN/m)": V_c, "e (m)": float("nan"),
+                               "q_toe (kPa)": float("nan"), "q_heel (kPa)": float("nan"),
+                               "Mu heel (kNm/m)": float("nan"), "Mu toe (kNm/m)": float("nan")})
+            continue
+        q = pr["fn"]
+        # Heel: beban ke bawah dikurangi reaksi tanah, momen terhadap muka dalam stem
+        down = [(fD * w6, x6), (fD * w3b, x3b), (fD * w4, x4), (fLv * w7, x7)]
+        V_down = sum(F for F, _ in down)
+        M_down = sum(F * (x - x_face) for F, x in down)
+        F_up = _integrate(q, x_face, B)
+        M_up = _integrate(lambda xs: q(xs) * (xs - x_face), x_face, B)
+        Mu_h = max(0.0, M_down - M_up)
+        Vu_h = max(0.0, V_down - F_up)
+        if Mu_h > heel_best["Mu"] or heel_best["combo"] == "-":
+            heel_best["Mu"], heel_best["combo"] = Mu_h, name
+        heel_best["Vu"] = max(heel_best["Vu"], Vu_h)
+
+        # Toe: reaksi tanah ke atas dikurangi berat pelat toe + tanah penutup
+        Mu_t = Vu_t = 0.0
+        if p.B_toe > 0.05:
+            dead_toe = fD * (W_slab_toe + w8)
+            M_up_t = _integrate(lambda xs: q(xs) * (p.B_toe - xs), 0.0, p.B_toe)
+            Mu_t = max(0.0, M_up_t - dead_toe * (p.B_toe / 2.0))
+            L_v = max(0.0, p.B_toe - d_toe_m)
+            F_up_t = _integrate(q, 0.0, L_v)
+            Vu_t = max(0.0, F_up_t - dead_toe * (L_v / p.B_toe))
+            if Mu_t > toe_best["Mu"] or toe_best["combo"] == "-":
+                toe_best["Mu"], toe_best["combo"] = Mu_t, name
+            toe_best["Vu"] = max(toe_best["Vu"], Vu_t)
+        rows_found.append({"Kombinasi": name, "ΣV_u (kN/m)": V_c, "e (m)": pr["e"],
+                           "q_toe (kPa)": pr["q_toe"], "q_heel (kPa)": pr["q_heel"],
+                           "Mu heel (kNm/m)": Mu_h, "Mu toe (kNm/m)": Mu_t})
+
+    note_f = "Resultan di luar dasar pada kombinasi terfaktor" if foundation_invalid else None
+    rebar_heel = check_section(heel_best["Mu"], heel_best["Vu"], p.t_slab_base * 1000.0, p.cc_slab,
+                               p.D_heel, p.s_heel, p.fc, p.fy, fail_note=note_f)
+    rebar_heel["combo"] = heel_best["combo"]
+    if p.B_toe > 0.05:
+        rebar_toe = check_section(toe_best["Mu"], toe_best["Vu"], p.t_slab_base * 1000.0, p.cc_slab,
+                                  p.D_toe, p.s_toe, p.fc, p.fy, fail_note=note_f)
+        rebar_toe["combo"] = toe_best["combo"]
+    else:
+        rebar_toe = None
+
+    return {
+        "B": B, "H_tot": H_tot, "H_stem": H_stem, "D_emb": D_emb, "Ka": Ka, "Kp": Kp,
+        "Kae": Kae, "dKae": dKae, "seismic_valid": seismic_valid, "kh": kh,
+        "df_v": df_v, "V_all": V_all, "MR_all": MR_all, "V_noq": V_noq, "MR_noq": MR_noq,
+        "Pa": Pa, "Pq": Pq, "Pw": Pw, "dPae": dPae, "Pir": Pir, "yir": yir,
+        "Pp_front": Pp_front, "Pp_key": Pp_key, "mu_eff": mu_eff, "c_d": c_d,
+        "case_stat": case_stat, "case_seis": case_seis,
+        "press_stat": q_stat, "press_seis": q_seis,
+        "SF_gov_stat": SF_gov_stat, "SF_gov_seis": SF_gov_seis,
+        "rebar_stem": rebar_stem, "rebar_heel": rebar_heel, "rebar_toe": rebar_toe,
+        "rebar_pocket": rebar_pocket, "found_rows": pd.DataFrame(rows_found),
+        "warnings": warnings,
+    }
+
+
+# ==============================================================================
+# SKETSA PENAMPANG
+# ==============================================================================
+def create_cross_section_plot(p, res):
+    fig, ax = plt.subplots(figsize=(8.5, 6.2), dpi=160)
+    B, H_tot = res["B"], res["H_tot"]
+    pr = res["press_stat"]
+
+    poly_pts = [
+        (0.0, 0.0), (B, 0.0), (B, p.t_slab_tip),
+        (p.B_toe + p.t_bot, p.t_slab_base), (p.B_toe + p.t_bot, H_tot),
+        (p.B_toe + (p.t_bot - p.t_top), H_tot), (p.B_toe, p.t_slab_base),
+        (0.0, p.t_slab_base),
+    ]
+    ax.add_patch(patches.Polygon(poly_pts, closed=True, facecolor="#D3D7DC",
+                                 edgecolor="#1F2937", linewidth=1.8, label="Beton DPT"))
+    if p.use_shear_key and p.D_key > 0:
+        ax.add_patch(patches.Rectangle((p.B_toe + p.t_bot - p.B_key, -p.D_key), p.B_key, p.D_key,
+                                       facecolor="#B0B7C0", edgecolor="#1F2937", linewidth=1.5))
+    if p.use_fence and p.H_panel > 0:
+        fx0 = p.B_toe + (p.t_bot - p.t_top) + (p.t_top - 0.17) / 2.0
+        ax.add_patch(patches.Rectangle((fx0, H_tot), 0.17, p.H_panel, facecolor="#E5E7EB",
+                                       edgecolor="#374151", linewidth=1.3, hatch="//"))
+        if p.H_wire > 0:
+            ax.plot([fx0 + 0.085] * 2, [H_tot + p.H_panel, H_tot + p.H_panel + p.H_wire],
+                    color="#4B5563", lw=1.5, ls="--")
+
+    ax.plot([p.B_toe + p.t_bot, B + 1.2], [H_tot, H_tot], color="#78350F", lw=2.2)
+    ax.fill_between([p.B_toe + p.t_bot, B + 1.2], p.t_slab_base, H_tot, color="#FDE68A",
+                    alpha=0.35, label="Tanah Urug (Backfill)")
+    front_y = p.t_slab_base + p.D_f
+    ax.plot([-1.0, p.B_toe], [front_y, front_y], color="#065F46", lw=2.2)
+    ax.fill_between([-1.0, p.B_toe], 0.0, front_y, color="#A7F3D0", alpha=0.35, label="Tanah Depan (Df)")
+
+    scale_p = 0.8 / max(10.0, res["Ka"] * p.gamma_1 * H_tot)
+    p_base = res["Ka"] * p.gamma_1 * H_tot * scale_p
+    x_diag = B + 0.25
+    ax.plot([x_diag, x_diag, x_diag + p_base, x_diag], [0, H_tot, 0, 0], color="#DC2626", lw=1.5)
+    ax.fill([x_diag, x_diag + p_base, x_diag], [H_tot, 0, 0], color="#FCA5A5", alpha=0.45)
+    ax.text(x_diag + p_base * 0.35, H_tot / 3.0 + 0.12, f"Pa = {res['Pa']:.1f} kN/m",
+            color="#991B1B", fontsize=8.5, fontweight="bold")
+
+    y0_q = -p.D_key - 0.15
+    q_max_plot = max(pr["q_max"], 1.0)
+    scale_q = 0.65 / max(50.0, q_max_plot)
+    xs = np.linspace(0.0, B, 80)
+    qs = np.asarray(pr["fn"](xs), dtype=float)
+    ys = y0_q - qs * scale_q
+    ax.fill(np.concatenate([xs, xs[::-1]]), np.concatenate([ys, np.full_like(xs, y0_q)]),
+            color="#93C5FD", alpha=0.45)
+    ax.plot(xs, ys, color="#2563EB", lw=1.5)
+    ax.plot([0, B], [y0_q, y0_q], color="#2563EB", lw=1.0)
+    ax.text(0.02, y0_q - q_max_plot * scale_q - 0.18, f"q_toe = {pr['q_toe']:.1f} kPa",
+            color="#1E40AF", fontsize=8.5, fontweight="bold")
+    ax.text(max(0.0, B - 0.9), y0_q - q_max_plot * scale_q - 0.18, f"q_heel = {pr['q_heel']:.1f} kPa",
+            color="#1E40AF", fontsize=8.5)
+    ax.text(B / 2.0, y0_q - q_max_plot * scale_q - 0.45,
+            f"B = {B:.2f} m (Toe={p.B_toe:.2f}, Heel={p.B_heel:.2f}) | {pr['mode']}",
+            ha="center", fontsize=9, fontweight="bold", color="#111827")
+
+    ax.set_xlim(-1.1, B + 1.5)
+    ax.set_ylim(y0_q - q_max_plot * scale_q - 0.7, H_tot + (p.H_panel + p.H_wire if p.use_fence else 0) + 0.45)
+    ax.set_aspect("equal")
+    ax.grid(True, linestyle=":", alpha=0.5)
+    ax.set_title(f"Sketsa Penampang & Distribusi Gaya — {p.wall_type_name}", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Lebar (m)")
+    ax.set_ylabel("Elevasi Relatif (m)")
+    plt.tight_layout()
+    return fig
+
+
+# ==============================================================================
+# TABEL HASIL (dipakai UI, Word, Excel)
+# ==============================================================================
+def build_sf_table(p, res):
+    cs, ce = res["case_stat"], res["case_seis"]
+    B = res["B"]
+    rows = []
+
+    def ok(v, req):
+        return "OK" if v >= req else "NOT OK"
+
+    rows.append({
+        "Kriteria Kontrol": "1. Stabilitas Guling",
+        "Nilai Statis": f"{cs['SF_ot']:.2f}", "Syarat Statis": f"≥ {p.SF_ot_stat:.2f}",
+        "Status Statis": ok(cs["SF_ot"], p.SF_ot_stat),
+        "Nilai Gempa": f"{ce['SF_ot']:.2f}", "Syarat Gempa": f"≥ {p.SF_ot_seis:.2f}",
+        "Status Gempa": ok(ce["SF_ot"], p.SF_ot_seis),
+    })
+    rows.append({
+        "Kriteria Kontrol": "2. Stabilitas Geser",
+        "Nilai Statis": f"{cs['SF_sl']:.2f}", "Syarat Statis": f"≥ {p.SF_sl_stat:.2f}",
+        "Status Statis": ok(cs["SF_sl"], p.SF_sl_stat),
+        "Nilai Gempa": f"{ce['SF_sl']:.2f}", "Syarat Gempa": f"≥ {p.SF_sl_seis:.2f}",
+        "Status Gempa": ok(ce["SF_sl"], p.SF_sl_seis),
+    })
+
+    def bc_txt(c):
+        if c["bc"] is None:
+            return "n/a"
+        return f"{c['SF_bc']:.2f} (q_ult={c['bc']['q_ult']:.0f}, q_eff={c['q_app']:.0f} kPa)"
+
+    rows.append({
+        "Kriteria Kontrol": "3. Kapasitas Dukung (Meyerhof, B', beban miring)",
+        "Nilai Statis": bc_txt(cs), "Syarat Statis": f"≥ {p.SF_bc_target:.2f}",
+        "Status Statis": ok(cs["SF_bc"], p.SF_bc_target),
+        "Nilai Gempa": bc_txt(ce), "Syarat Gempa": f"≥ {p.SF_bc_seis:.2f}",
+        "Status Gempa": ok(ce["SF_bc"], p.SF_bc_seis),
+    })
+    if p.q_all > 0:
+        lim_seis = p.q_all * p.q_all_seis_factor
+        rows.append({
+            "Kriteria Kontrol": "4. q_maks ≤ q_all (laporan tanah)",
+            "Nilai Statis": f"{cs['press']['q_max']:.1f} kPa", "Syarat Statis": f"≤ {p.q_all:.0f} kPa",
+            "Status Statis": "OK" if cs["press"]["q_max"] <= p.q_all else "NOT OK",
+            "Nilai Gempa": f"{ce['press']['q_max']:.1f} kPa", "Syarat Gempa": f"≤ {lim_seis:.0f} kPa",
+            "Status Gempa": "OK" if ce["press"]["q_max"] <= lim_seis else "NOT OK",
+        })
+    rows.append({
+        "Kriteria Kontrol": "5. Eksentrisitas Dasar",
+        "Nilai Statis": f"e = {cs['press']['e']:.3f} m", "Syarat Statis": f"|e| ≤ {B/6.0:.3f} m",
+        "Status Statis": "OK" if cs["press"]["valid"] and abs(cs["press"]["e"]) <= B / 6.0 else "NOT OK",
+        "Nilai Gempa": f"e = {ce['press']['e']:.3f} m", "Syarat Gempa": f"|e| ≤ {B/4.0:.3f} m",
+        "Status Gempa": "OK" if ce["press"]["valid"] and abs(ce["press"]["e"]) <= B / 4.0 else "NOT OK",
+    })
+    return pd.DataFrame(rows)
+
+
+def build_rebar_table(p, res):
+    rows = []
+
+    def add(elem, side, rb, dia, sp):
+        if rb is None:
+            rows.append({"Elemen Struktur": elem, "Sisi Tarik": side, "Tebal h (mm)": "-",
+                         "Kombinasi": "-", "Mu (kNm/m)": "-", "As Perlu (mm²)": "-",
+                         "Tulangan Terpasang": "Tidak ada (B_toe = 0)", "As Pasang (mm²)": "-",
+                         "D/C Lentur": "-", "Vu (kN/m)": "-", "φVc (kN/m)": "-", "D/C Geser": "-",
+                         "Status": "N/A", "Catatan": ""})
+            return
+        as_req = "-" if rb["As_req"] != rb["As_req"] else f"{rb['As_req']:.0f}"
+        rows.append({
+            "Elemen Struktur": elem, "Sisi Tarik": side, "Tebal h (mm)": f"{rb['h_mm']:.0f}",
+            "Kombinasi": rb.get("combo", "-"), "Mu (kNm/m)": f"{rb['Mu']:.2f}",
+            "As Perlu (mm²)": as_req, "Tulangan Terpasang": f"D{dia}-{sp}",
+            "As Pasang (mm²)": f"{rb['As_prov']:.0f}", "D/C Lentur": f"{rb['dc_flex']:.2f}",
+            "Vu (kN/m)": f"{rb['Vu']:.2f}", "φVc (kN/m)": f"{rb['phi_Vc']:.2f}",
+            "D/C Geser": f"{rb['dc_shear']:.2f}", "Status": rb["status"], "Catatan": rb["notes"],
+        })
+
+    add("Dinding Vertikal (Stem)", "Sisi Dalam (Backfill)", res["rebar_stem"], p.D_wall, p.s_wall)
+    add("Slab Belakang (Heel)", "Serat Atas", res["rebar_heel"], p.D_heel, p.s_heel)
+    add("Slab Depan (Toe)", "Serat Bawah", res["rebar_toe"], p.D_toe, p.s_toe)
+    if res["rebar_pocket"] is not None:
+        add("Dinding Pocket Pagar (pendekatan)", "Lokal", res["rebar_pocket"], 10, 150)
+    return pd.DataFrame(rows)
+
+
+LIMITATIONS = [
+    "Stabilitas global/lereng (bidang gelincir dalam) dan penurunan tidak dianalisis.",
+    "Muka air tanah, tekanan air, dan drainase (weep hole, filter) tidak dimodelkan; dinding diasumsikan terdrainase penuh.",
+    "Tekanan tanah: Rankine (urugan datar, dinding vertikal pada bidang virtual di ujung heel); c tanah urug diabaikan; tension crack tidak dimodelkan.",
+    "Gempa: Mononobe-Okabe pseudo-statik dengan kv = 0 dan delta dinding = 0; nilai kh dan faktor SF gempa wajib diverifikasi terhadap SNI 1726:2019 / SNI 8460:2017.",
+    "Parameter tanah (c, phi, gamma, q_all) adalah input pengguna; bila berasal dari korelasi sondir/SPT, gunakan nilai karakteristik yang konservatif.",
+    "Beton: shear key, panjang penyaluran, sambungan lewatan, cut-off tulangan, dan detail pocket pagar tidak didesain.",
+    "Faktor beban/kombinasi mengikuti pola SNI 1727:2020 dan SNI 2847:2019; periksa pasal rujukan pada dokumen resmi sebelum dipakai untuk desain final.",
+]
+
+
+# ==============================================================================
+# EXPORT
+# ==============================================================================
+def generate_word_report(p, res, fig, df_sf, df_rebar):
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(10.5)
+
+    title = doc.add_heading("LAPORAN PERHITUNGAN GEOTEKNIK & STRUKTUR\nDINDING PENAHAN TANAH (DPT)", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    meta = doc.add_paragraph()
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    meta.add_run(f"Proyek: {p.project_name}\n").bold = True
+    meta.add_run(f"Tipe: {p.wall_type_name} | Perencana: {p.engineer_name} | "
+                 f"Tanggal: {datetime.now().strftime('%d-%m-%Y')}")
+
+    doc.add_heading("1. Kriteria Desain & Referensi", level=2)
+    doc.add_paragraph(
+        "• SNI 8460:2017 — Persyaratan Perancangan Geoteknik.\n"
+        "• SNI 2847:2019 — Persyaratan Beton Struktural untuk Bangunan Gedung.\n"
+        "• SNI 1727:2020 — Beban Desain Minimum dan Kriteria Terkait.\n"
+        "• SNI 1726:2019 — Tata Cara Perencanaan Ketahanan Gempa (untuk parameter gempa).\n"
+        "Metode: Rankine (statis), Mononobe-Okabe (gempa), kapasitas dukung Meyerhof dengan lebar efektif "
+        "dan faktor kemiringan beban."
+    )
+
+    doc.add_heading("2. Parameter Input", level=2)
+    t_in = doc.add_table(rows=1, cols=4)
+    t_in.style = "Table Grid"
+    for i, h in enumerate(["Geometri & Beban", "Nilai", "Tanah & Material", "Nilai"]):
+        t_in.rows[0].cells[i].text = h
+    pairs = [
+        ("Tinggi Ekspos (H_exp)", f"{p.H_exp:.2f} m", "Tanah Urug (γ1 / φ1)", f"{p.gamma_1} kN/m³ / {p.phi_1}° (c diabaikan)"),
+        ("Df (dari muka pelat)", f"{p.D_f:.2f} m", "Tanah Dasar (γ2 / φ2 / c2)", f"{p.gamma_2} kN/m³ / {p.phi_2}° / {p.c_2} kPa"),
+        ("Stem (atas / bawah)", f"{p.t_top:.2f} / {p.t_bot:.2f} m", "q_all (laporan tanah)", f"{p.q_all:.0f} kPa"),
+        ("Toe / Heel", f"{p.B_toe:.2f} / {p.B_heel:.2f} m", "δ/φ2, μ input → μ dipakai", f"{p.delta_ratio:.2f}, {p.mu_base:.2f} → {res['mu_eff']:.3f}"),
+        ("Lebar Total B", f"{res['B']:.2f} m", "Reduksi kohesi Rc / pasif", f"{p.R_c:.2f} / {p.R_pasif if p.use_passive else 0:.2f}"),
+        ("Slab (pangkal / ujung)", f"{p.t_slab_base:.2f} / {p.t_slab_tip:.2f} m", "Tanah depan diabaikan", f"{p.z_ign:.2f} m"),
+        ("Shear Key", f"{p.D_key:.2f} × {p.B_key:.2f} m" if p.use_shear_key else "Tidak ada", "kh", f"{p.k_h:.3f}"),
+        ("Pagar / Surcharge", f"H={p.H_panel + p.H_wire:.2f} m, q={p.q_surch:.1f} kPa", "fc' / fy", f"{p.fc:.1f} / {p.fy:.0f} MPa"),
+        ("Ka / Kp / Kae", f"{res['Ka']:.3f} / {res['Kp']:.3f} / {res['Kae']:.3f}", "Selimut (dinding / slab)", f"{p.cc_wall} / {p.cc_slab} mm"),
+    ]
+    for r in pairs:
+        cells = t_in.add_row().cells
+        for i, v in enumerate(r):
+            cells[i].text = str(v)
+
+    doc.add_heading("3. Sketsa", level=2)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    buf.seek(0)
+    doc.add_picture(buf, width=Inches(6.0))
+    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_heading("4. Ringkasan Stabilitas Eksternal", level=2)
+    t_sf = doc.add_table(rows=1, cols=len(df_sf.columns))
+    t_sf.style = "Table Grid"
+    for i, c in enumerate(df_sf.columns):
+        t_sf.rows[0].cells[i].text = c
+    for _, r in df_sf.iterrows():
+        cells = t_sf.add_row().cells
+        for i, c in enumerate(df_sf.columns):
+            cells[i].text = str(r[c])
+    doc.add_paragraph(f"SF governing statis = {res['SF_gov_stat']:.2f} | SF governing gempa = {res['SF_gov_seis']:.2f}")
+
+    doc.add_heading("5. Gaya Vertikal & Momen Penahan", level=2)
+    t_v = doc.add_table(rows=1, cols=4)
+    t_v.style = "Table Grid"
+    for i, c in enumerate(res["df_v"].columns):
+        t_v.rows[0].cells[i].text = c
+    for _, r in res["df_v"].iterrows():
+        cells = t_v.add_row().cells
+        cells[0].text = str(r["Komponen"])
+        cells[1].text = f"{r['Gaya_V (kN/m)']:.2f}"
+        cells[2].text = f"{r['Lengan_x (m)']:.3f}"
+        cells[3].text = f"{r['Momen_Penahan (kNm/m)']:.2f}"
+
+    doc.add_heading("6. Gaya Horizontal & Tahanan", level=2)
+    doc.add_paragraph(
+        f"Pa = {res['Pa']:.2f} | Pq = {res['Pq']:.2f} | Pw = {res['Pw']:.2f} | ΔPae = {res['dPae']:.2f} | "
+        f"Pir = {res['Pir']:.2f} kN/m\n"
+        f"Pasif depan (tereduksi) = {res['Pp_front']:.2f} | Pasif key (tereduksi) = {res['Pp_key']:.2f} kN/m\n"
+        f"Kohesi efektif untuk geser/pasif = {res['c_d']:.2f} kPa | μ dipakai = {res['mu_eff']:.3f}"
+    )
+
+    doc.add_heading("7. Penulangan Beton (SNI 2847:2019)", level=2)
+    cols = ["Elemen Struktur", "Kombinasi", "h (mm)", "Mu (kNm)", "As Perlu", "Tulangan", "D/C Lentur", "D/C Geser", "Status"]
+    t_rb = doc.add_table(rows=1, cols=len(cols))
+    t_rb.style = "Table Grid"
+    for i, c in enumerate(cols):
+        t_rb.rows[0].cells[i].text = c
+    for _, r in df_rebar.iterrows():
+        cells = t_rb.add_row().cells
+        vals = [r["Elemen Struktur"], r["Kombinasi"], r["Tebal h (mm)"], r["Mu (kNm/m)"], r["As Perlu (mm²)"],
+                r["Tulangan Terpasang"], r["D/C Lentur"], r["D/C Geser"], r["Status"]]
+        for i, v in enumerate(vals):
+            cells[i].text = str(v)
+
+    doc.add_heading("8. Batasan Analisis", level=2)
+    for line in LIMITATIONS:
+        doc.add_paragraph(line, style="List Bullet")
+
+    out = io.BytesIO()
+    doc.save(out)
+    out.seek(0)
+    return out
+
+
+def generate_excel_report(p, res, fig, df_sf, df_rebar):
+    """Workbook berisi NILAI hasil perhitungan aplikasi (bukan rumus dinamis)."""
+    wb = openpyxl.Workbook()
+    f_title = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+    f_bold = Font(name="Calibri", size=10, bold=True)
+    fill_h = PatternFill("solid", fgColor="1E3A8A")
+    fill_s = PatternFill("solid", fgColor="DBEAFE")
+    thin = Side(style="thin", color="9CA3AF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def write_table(ws, r0, headers, rows):
+        for j, h in enumerate(headers, start=1):
+            c = ws.cell(row=r0, column=j, value=h)
+            c.font, c.fill, c.border = f_bold, fill_s, border
+        for i, row in enumerate(rows, start=1):
+            for j, v in enumerate(row, start=1):
+                c = ws.cell(row=r0 + i, column=j, value=v)
+                c.border = border
+                if isinstance(v, float):
+                    c.number_format = "0.000"
+        return r0 + len(rows) + 2
+
+    ws1 = wb.active
+    ws1.title = "1_Input"
+    ws1.merge_cells("A1:E1")
+    ws1["A1"] = f"PERHITUNGAN DPT — {p.wall_type_name}"
+    ws1["A1"].font, ws1["A1"].fill = f_title, fill_h
+    ws1["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws1["A2"] = "Catatan: sheet ini berisi nilai hasil perhitungan aplikasi (bukan rumus dinamis)."
+    ws1["A3"] = "Proyek:"
+    ws1["B3"] = p.project_name
+    ws1["A4"] = "Perencana:"
+    ws1["B4"] = p.engineer_name
+    inputs = [
+        ("Tinggi Ekspos", "H_exp", p.H_exp, "m"), ("Df (dari muka pelat)", "Df", p.D_f, "m"),
+        ("Tebal Puncak Stem", "t_top", p.t_top, "m"), ("Tebal Dasar Stem", "t_bot", p.t_bot, "m"),
+        ("Panjang Toe", "B_toe", p.B_toe, "m"), ("Panjang Heel", "B_heel", p.B_heel, "m"),
+        ("Tebal Slab Pangkal", "t_slab_base", p.t_slab_base, "m"), ("Tebal Slab Ujung", "t_slab_tip", p.t_slab_tip, "m"),
+        ("Kedalaman Shear Key", "D_key", p.D_key, "m"), ("Lebar Shear Key", "B_key", p.B_key, "m"),
+        ("Tinggi Pagar+Kawat", "H_fence", p.H_panel + p.H_wire if p.use_fence else 0.0, "m"),
+        ("Tekanan Angin", "q_wind", p.q_wind, "kPa"), ("Surcharge", "q_surch", p.q_surch, "kPa"),
+        ("γ Tanah Urug", "gamma_1", p.gamma_1, "kN/m3"), ("φ Tanah Urug", "phi_1", p.phi_1, "deg"),
+        ("γ Tanah Dasar", "gamma_2", p.gamma_2, "kN/m3"), ("φ Tanah Dasar", "phi_2", p.phi_2, "deg"),
+        ("c Tanah Dasar", "c_2", p.c_2, "kPa"), ("q_all (laporan tanah)", "q_all", p.q_all, "kPa"),
+        ("δ/φ2", "delta_ratio", p.delta_ratio, "-"), ("μ input", "mu", p.mu_base, "-"),
+        ("Reduksi kohesi", "R_c", p.R_c, "-"), ("Reduksi pasif", "R_pasif", p.R_pasif if p.use_passive else 0.0, "-"),
+        ("Tanah depan diabaikan", "z_ign", p.z_ign, "m"), ("kh", "k_h", p.k_h, "-"),
+        ("fc'", "fc", p.fc, "MPa"), ("fy", "fy", p.fy, "MPa"),
+        ("Selimut dinding", "cc_wall", p.cc_wall, "mm"), ("Selimut slab", "cc_slab", p.cc_slab, "mm"),
+        ("Tul. dinding", "D-s", f"D{p.D_wall}-{p.s_wall}", ""), ("Tul. heel", "D-s", f"D{p.D_heel}-{p.s_heel}", ""),
+        ("Tul. toe", "D-s", f"D{p.D_toe}-{p.s_toe}", ""),
+    ]
+    write_table(ws1, 6, ["PARAMETER", "SIMBOL", "NILAI", "SATUAN"], inputs)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    buf.seek(0)
+    img = XLImage(buf)
+    img.width, img.height = 480, 350
+    ws1.add_image(img, "F6")
+
+    ws2 = wb.create_sheet("2_Stabilitas")
+    ws2["A1"] = "STABILITAS EKSTERNAL (nilai)"
+    ws2["A1"].font = Font(name="Calibri", size=12, bold=True)
+    r = write_table(ws2, 3, list(df_sf.columns), df_sf.values.tolist())
+    forces = [
+        ("Ka", res["Ka"]), ("Kp", res["Kp"]), ("Kae", res["Kae"]), ("kh", res["kh"]),
+        ("Pa (kN/m)", res["Pa"]), ("Pq (kN/m)", res["Pq"]), ("Pw (kN/m)", res["Pw"]),
+        ("ΔPae (kN/m)", res["dPae"]), ("Pir (kN/m)", res["Pir"]),
+        ("Pasif depan tereduksi (kN/m)", res["Pp_front"]), ("Pasif key tereduksi (kN/m)", res["Pp_key"]),
+        ("μ dipakai", res["mu_eff"]), ("c efektif geser/pasif (kPa)", res["c_d"]),
+        ("ΣV dgn surcharge (kN/m)", res["V_all"]), ("ΣV tanpa surcharge (kN/m)", res["V_noq"]),
+        ("ΣMR tanpa surcharge (kNm/m)", res["MR_noq"]),
+        ("Fh statis (kN/m)", res["case_stat"]["Fh"]), ("Mo statis (kNm/m)", res["case_stat"]["Mo"]),
+        ("Fh gempa (kN/m)", res["case_seis"]["Fh"]), ("Mo gempa (kNm/m)", res["case_seis"]["Mo"]),
+    ]
+    write_table(ws2, r, ["Besaran", "Nilai"], forces)
+
+    ws3 = wb.create_sheet("3_Gaya_Vertikal")
+    write_table(ws3, 1, list(res["df_v"].columns), res["df_v"].values.tolist())
+
+    ws4 = wb.create_sheet("4_Penulangan")
+    r = write_table(ws4, 1, list(df_rebar.columns), df_rebar.values.tolist())
+    fr = res["found_rows"]
+    write_table(ws4, r, list(fr.columns), fr.values.tolist())
+
+    for ws in wb.worksheets:
+        for col in ws.columns:
+            letter = openpyxl.utils.get_column_letter(col[0].column)
+            m = max((len(str(c.value)) for c in col if c.value is not None), default=10)
+            ws.column_dimensions[letter].width = max(12, min(m + 3, 48))
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
+
+
+# ==============================================================================
+# UI STREAMLIT
+# ==============================================================================
+def show_df(df):
+    # Kompatibel lintas versi Streamlit: parameter lebar berbeda antar versi.
+    try:
+        st.dataframe(df, width="stretch", hide_index=True)
+    except Exception:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def dl_button(label, data, file_name, mime):
+    try:
+        st.download_button(label=label, data=data, file_name=file_name, mime=mime, width="stretch")
+    except Exception:
+        st.download_button(label=label, data=data, file_name=file_name, mime=mime, use_container_width=True)
+
+
+def collect_inputs():
+    p = SimpleNamespace()
+    with st.sidebar:
+        st.header("1. Identitas Proyek")
+        p.project_name = st.text_input("Nama Proyek", "Pembangunan Kawasan Industri & Perimeter Wall")
+        p.wall_type_name = st.text_input("Kode / Tipe DPT", "DPT-1 (H_exp = 2.51 m)")
+        p.engineer_name = st.text_input("Perencana Struktur", "")
+
+        st.header("2. Geometri Penampang (m)")
+        g1, g2 = st.columns(2)
+        with g1:
+            p.H_exp = st.number_input("Tinggi Ekspos (H_exp)", min_value=0.2, max_value=12.0, value=2.51, step=0.05)
+            p.t_top = st.number_input("Tebal Puncak Stem", min_value=0.15, max_value=1.5, value=0.26, step=0.01)
+            p.B_toe = st.number_input("Panjang Toe (0 = Tipe L)", min_value=0.0, max_value=5.0, value=0.00, step=0.05)
+            p.t_slab_base = st.number_input("Tebal Slab Pangkal", min_value=0.15, max_value=1.5, value=0.35, step=0.05)
+        with g2:
+            p.D_f = st.number_input("Df: tinggi tanah depan di atas muka pelat", min_value=0.3, max_value=5.0, value=1.00, step=0.05)
+            p.t_bot = st.number_input("Tebal Dasar Stem", min_value=0.15, max_value=2.0, value=0.35, step=0.01)
+            p.B_heel = st.number_input("Panjang Heel", min_value=0.2, max_value=8.0, value=1.65, step=0.05)
+            p.t_slab_tip = st.number_input("Tebal Slab Ujung", min_value=0.15, max_value=1.5, value=0.25, step=0.05)
+
+        p.use_shear_key = st.checkbox("Gunakan Shear Key (Kunci Geser)", value=True)
+        if p.use_shear_key:
+            k1, k2 = st.columns(2)
+            with k1:
+                p.D_key = st.number_input("Kedalaman Key (m)", min_value=0.15, max_value=2.0, value=0.40, step=0.05)
+            with k2:
+                p.B_key = st.number_input("Lebar Key (m)", min_value=0.15, max_value=1.5, value=0.30, step=0.05)
+        else:
+            p.D_key, p.B_key = 0.0, 0.0
+
+        st.header("3. Pagar Atas & Beban Lalu Lintas")
+        p.use_fence = st.checkbox("Ada Pagar Precast di Puncak DPT", value=True)
+        if p.use_fence:
+            f1, f2 = st.columns(2)
+            with f1:
+                p.H_panel = st.number_input("Tinggi Panel Pagar (m)", min_value=0.5, max_value=4.0, value=2.00, step=0.1)
+                p.q_wind = st.number_input("Tekanan Angin (kPa)", min_value=0.0, max_value=3.0, value=0.60, step=0.05)
+            with f2:
+                p.H_wire = st.number_input("Tinggi Kawat Duri (m)", min_value=0.0, max_value=1.5, value=0.50, step=0.1)
+                p.d_pocket = st.number_input("Kedalaman Pocket (m)", min_value=0.2, max_value=1.0, value=0.50, step=0.05)
+        else:
+            p.H_panel, p.H_wire, p.q_wind, p.d_pocket = 0.0, 0.0, 0.0, 0.0
+        p.q_surch = st.number_input("Beban Surcharge Jalan (kPa)", min_value=0.0, max_value=50.0, value=10.0, step=1.0)
+
+        st.header("4. Parameter Tanah")
+        s1, s2 = st.columns(2)
+        with s1:
+            p.gamma_1 = st.number_input("γ Tanah Urug (kN/m³)", 14.0, 22.0, 18.0, 0.5)
+            p.phi_1 = st.number_input("φ Tanah Urug (°)", 15.0, 45.0, 30.0, 1.0)
+            p.q_all = st.number_input("q_all laporan tanah (kPa, 0 = tidak dipakai)", 0.0, 600.0, 150.0, 10.0)
+            p.mu_base = st.number_input("μ maksimum dasar (input)", 0.20, 0.75, 0.45, 0.05)
+        with s2:
+            p.gamma_2 = st.number_input("γ Tanah Dasar (kN/m³)", 14.0, 22.0, 18.5, 0.5)
+            p.phi_2 = st.number_input("φ Tanah Dasar (°)", 15.0, 45.0, 32.0, 1.0)
+            p.c_2 = st.number_input("c Tanah Dasar (kPa)", 0.0, 100.0, 5.0, 1.0)
+            p.SF_bc_target = st.number_input("SF Daya Dukung Statis (min)", 2.0, 4.0, 3.0, 0.5)
+        st.caption("c tanah urug diabaikan pada tekanan aktif (konservatif).")
+
+        st.subheader("Tahanan Geser & Pasif")
+        p.delta_ratio = st.slider("δ / φ₂ (gesekan dasar beton-tanah)", 0.50, 1.00, 0.67, 0.01)
+        p.R_c = st.slider("Faktor reduksi kohesi c₂ (geser & pasif)", 0.0, 1.0, 0.5, 0.05)
+        p.z_ign = st.number_input("Kedalaman tanah depan diabaikan (tergerus/terganggu, m)", 0.0, 3.0, 0.5, 0.1)
+        p.use_passive = st.checkbox("Perhitungkan tekanan pasif (depan & shear key)", value=True)
+        p.R_pasif = st.slider("Faktor reduksi pasif", 0.0, 1.0, 0.50, 0.05) if p.use_passive else 0.0
+
+        st.header("5. Gempa")
+        p.kh_mode = st.radio("Sumber kh", ["Input manual", "Dari PGA_M (kh = faktor × F_PGA × PGA)"])
+        p.kh_manual, p.PGA, p.F_PGA, p.kh_factor = 0.15, 0.30, 1.0, 0.5
+        if p.kh_mode.startswith("Input"):
+            p.kh_manual = st.number_input("Koef. Gempa Horizontal (kh)", 0.00, 0.60, 0.15, 0.01)
+        else:
+            p.PGA = st.number_input("PGA batuan dasar (g)", 0.0, 1.5, 0.30, 0.01)
+            p.F_PGA = st.number_input("F_PGA (faktor situs)", 0.5, 3.0, 1.0, 0.05)
+            p.kh_factor = st.number_input("Faktor kh/PGA_M (verifikasi ke SNI)", 0.1, 1.0, 0.5, 0.05)
+        p.k_h = calc_kh(p.kh_mode, p.kh_manual, p.PGA, p.F_PGA, p.kh_factor)
+        st.caption(f"kh dipakai = {p.k_h:.3f}")
+        p.delta_mo_ratio = st.slider("δ dinding Mononobe-Okabe / φ₁ (0 = konsisten Rankine)", 0.0, 0.67, 0.0, 0.01)
+
+        with st.expander("Kriteria Safety Factor (verifikasi ke SNI 8460:2017)"):
+            p.SF_ot_stat = st.number_input("Guling statis ≥", 1.0, 4.0, 2.0, 0.05)
+            p.SF_sl_stat = st.number_input("Geser statis ≥", 1.0, 4.0, 1.5, 0.05)
+            p.SF_ot_seis = st.number_input("Guling gempa ≥", 1.0, 4.0, 1.5, 0.05)
+            p.SF_sl_seis = st.number_input("Geser gempa ≥", 1.0, 4.0, 1.15, 0.05)
+            p.SF_bc_seis = st.number_input("Daya dukung gempa ≥", 1.0, 4.0, 2.0, 0.05)
+            p.q_all_seis_factor = st.number_input("Faktor kenaikan q_all saat gempa", 1.0, 2.0, 1.5, 0.05)
+
+        st.header("6. Material & Tulangan")
+        m1, m2 = st.columns(2)
+        with m1:
+            p.fc = st.number_input("Mutu Beton fc' (MPa)", 17.5, 50.0, 25.0, 2.5)
+            p.cc_wall = st.number_input("Selimut Dinding (mm)", 40, 75, 40, 5)
+            p.D_wall = st.selectbox("Dia. Tul. Dinding (mm)", [10, 13, 16, 19, 22, 25], index=2)
+            p.D_heel = st.selectbox("Dia. Tul. Heel (mm)", [10, 13, 16, 19, 22, 25], index=2)
+            p.D_toe = st.selectbox("Dia. Tul. Toe (mm)", [10, 13, 16, 19, 22, 25], index=1)
+        with m2:
+            p.fy = st.number_input("Mutu Baja fy (MPa)", 240.0, 550.0, 420.0, 20.0)
+            p.cc_slab = st.number_input("Selimut Slab Bawah (mm)", 50, 100, 75, 5)
+            p.s_wall = st.number_input("Spasi Tul. Dinding (mm)", 75, 300, 150, 25)
+            p.s_heel = st.number_input("Spasi Tul. Heel (mm)", 75, 300, 150, 25)
+            p.s_toe = st.number_input("Spasi Tul. Toe (mm)", 75, 300, 150, 25)
+    return p
+
+
+def main():
+    st.set_page_config(page_title="Kalkulator DPT - SNI 8460 & SNI 2847", page_icon="🧱", layout="wide")
+    st.title("🧱 Kalkulator Analisis & Desain Dinding Penahan Tanah (DPT)")
+    st.caption("Alat bantu preliminary. Acuan: SNI 8460:2017, SNI 2847:2019, SNI 1727:2020, SNI 1726:2019. "
+               "Verifikasi seluruh kriteria terhadap dokumen resmi.")
+
+    p = collect_inputs()
+
+    if p.t_top > p.t_bot:
+        st.error("Tebal puncak stem tidak boleh lebih besar dari tebal dasar stem.")
+        st.stop()
+    if p.t_slab_tip > p.t_slab_base:
+        st.error("Tebal slab ujung tidak boleh lebih besar dari tebal slab pangkal.")
+        st.stop()
+    if p.cc_wall < 50 and p.D_wall >= 19:
+        st.warning("Selimut dinding < 50 mm untuk tulangan ≥ D19 pada beton yang kontak tanah: periksa Tabel 20.5.1.3.1 SNI 2847:2019.")
+    if p.cc_slab < 75:
+        st.warning("Selimut slab < 75 mm: 75 mm berlaku untuk beton yang dicor langsung pada tanah. Pastikan ada lantai kerja bila memakai nilai lebih kecil.")
+
+    res = run_calculations(p)
+    fig = create_cross_section_plot(p, res)
+    df_sf = build_sf_table(p, res)
+    df_rebar = build_rebar_table(p, res)
+
+    for w in res["warnings"]:
+        st.warning(w)
+
+    cs, ce = res["case_stat"], res["case_seis"]
+    st.subheader("1. Ringkasan Safety Factor")
+    c1, c2 = st.columns(2)
+
+    def mark(ok_):
+        return "✅" if ok_ else "❌"
+
+    with c1:
+        st.markdown("#### 🔹 Statis + Angin Pagar")
+        a, b_, c_, d_ = st.columns(4)
+        a.metric("Governing SF", f"{res['SF_gov_stat']:.2f}")
+        b_.metric(f"Guling (≥ {p.SF_ot_stat:.2f})", f"{cs['SF_ot']:.2f} {mark(cs['SF_ot'] >= p.SF_ot_stat)}")
+        c_.metric(f"Geser (≥ {p.SF_sl_stat:.2f})", f"{cs['SF_sl']:.2f} {mark(cs['SF_sl'] >= p.SF_sl_stat)}")
+        d_.metric(f"Dukung (≥ {p.SF_bc_target:.1f})", f"{cs['SF_bc']:.2f} {mark(cs['SF_bc'] >= p.SF_bc_target)}")
+    with c2:
+        st.markdown("#### 🔸 Gempa (Mononobe-Okabe)")
+        a, b_, c_, d_ = st.columns(4)
+        a.metric("Governing SF", f"{res['SF_gov_seis']:.2f}")
+        b_.metric(f"Guling (≥ {p.SF_ot_seis:.2f})", f"{ce['SF_ot']:.2f} {mark(ce['SF_ot'] >= p.SF_ot_seis)}")
+        c_.metric(f"Geser (≥ {p.SF_sl_seis:.2f})", f"{ce['SF_sl']:.2f} {mark(ce['SF_sl'] >= p.SF_sl_seis)}")
+        d_.metric(f"Dukung (≥ {p.SF_bc_seis:.1f})", f"{ce['SF_bc']:.2f} {mark(ce['SF_bc'] >= p.SF_bc_seis)}")
+
+    show_df(df_sf)
+
+    st.divider()
+    left, right = st.columns([1.15, 1.0])
+    with left:
+        st.subheader("2. Visualisasi Penampang & Diagram Gaya")
+        st.pyplot(fig)
+    with right:
+        st.subheader("3. Gaya Vertikal & Momen Penahan")
+        st.dataframe(res["df_v"].style.format({"Gaya_V (kN/m)": "{:.2f}", "Lengan_x (m)": "{:.3f}",
+                                               "Momen_Penahan (kNm/m)": "{:.2f}"}), hide_index=True)
+        st.info(
+            f"**Koefisien:** Ka = {res['Ka']:.3f} | Kp = {res['Kp']:.3f} | Kae = {res['Kae']:.3f} (kh = {res['kh']:.3f})\n\n"
+            f"**Gaya dorong:** Pa = {res['Pa']:.2f} | Pq = {res['Pq']:.2f} | Pw = {res['Pw']:.2f} | "
+            f"ΔPae = {res['dPae']:.2f} | Pir = {res['Pir']:.2f} kN/m\n\n"
+            f"**Tahanan geser:** μ dipakai = {res['mu_eff']:.3f} (min dari μ input dan tan δ) | "
+            f"c efektif = {res['c_d']:.2f} kPa | Pasif depan = {res['Pp_front']:.2f} | Pasif key = {res['Pp_key']:.2f} kN/m"
+        )
+        if cs["bc"] is not None:
+            b_s = cs["bc"]
+            st.caption(f"Kapasitas dukung statis: B' = {b_s['B_eff']:.2f} m, θ = {b_s['theta']:.1f}°, "
+                       f"Nc/Nq/Nγ = {b_s['Nc']:.1f}/{b_s['Nq']:.1f}/{b_s['Ng']:.1f}, "
+                       f"ic = {b_s['ic']:.2f}, iγ = {b_s['ig']:.2f}")
+
+    st.divider()
+    st.subheader("4. Desain Penulangan (SNI 2847:2019)")
+    show_df(df_rebar)
+    with st.expander("Reaksi tanah & momen pelat tiap kombinasi terfaktor"):
+        fr = res["found_rows"]
+        st.dataframe(fr.style.format({c: "{:.2f}" for c in fr.columns if c != "Kombinasi"}), hide_index=True)
+    st.caption("Tulangan susut & suhu arah memanjang dipasang minimal sesuai Tabel 24.4.3.2 SNI 2847:2019 "
+               "pada kedua sisi dinding dan pelat.")
+
+    with st.expander("Batasan analisis (baca sebelum memakai hasil)"):
+        for line in LIMITATIONS:
+            st.markdown(f"- {line}")
+
+    st.divider()
+    st.subheader("5. Export Hasil Perhitungan")
+    d1, d2 = st.columns(2)
+    key = p.wall_type_name.split()[0] if p.wall_type_name.split() else "DPT"
+    with d1:
+        dl_button("📄 Download Laporan (Word .docx)", generate_word_report(p, res, fig, df_sf, df_rebar),
+                  f"Laporan_DPT_{key}.docx",
+                  "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    with d2:
+        dl_button("📊 Download Calculation Sheet (Excel .xlsx, nilai)", generate_excel_report(p, res, fig, df_sf, df_rebar),
+                  f"Perhitungan_DPT_{key}.xlsx",
+                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+if __name__ == "__main__":
+    main()
